@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef } from "react";
 import { MapPin } from "lucide-react";
 
 type CityPoint = { city: string; lat: number | null; lng: number | null; count: number };
@@ -13,99 +13,160 @@ interface Props {
   onCityClick: (city: CityPoint) => void;
 }
 
-// Simple equirectangular projection to % position on the SVG backdrop
+// Simple equirectangular projection for the SVG fallback
 function toXY(lat: number, lng: number) {
   return { x: ((lng + 180) / 360) * 100, y: ((90 - lat) / 180) * 100 };
 }
 
-// ─── Mapbox map (only rendered when token is present) ─────────────────────────
+// ─── Leaflet map (free, no API key) ──────────────────────────────────────────
 
-function MapboxMap({ cities, trips, selectedCity, onCityClick }: Props) {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { default: Map, Marker, Popup } = require("react-map-gl/mapbox");
-  const [popupCity, setPopupCity] = useState<CityPoint | null>(selectedCity);
+function LeafletMap({ cities, trips, selectedCity, onCityClick }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<import("leaflet").Map | null>(null);
+  const markersRef = useRef<import("leaflet").CircleMarker[]>([]);
+  const tripMarkersRef = useRef<import("leaflet").Marker[]>([]);
 
-  const handleClick = (city: CityPoint) => {
-    setPopupCity(city);
-    onCityClick(city);
-  };
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) return;
 
-  // Track trip cities for distinct marker style
-  const tripCityNames = new Set(trips.map((t) => t.city.toLowerCase()));
+    import("leaflet").then((L) => {
+      // Fix default icon paths broken by webpack
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      delete (L.Icon.Default.prototype as any)._getIconUrl;
+      L.Icon.Default.mergeOptions({
+        iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+        iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+        shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+      });
+
+      const map = L.map(containerRef.current!, {
+        center: [25, 10],
+        zoom: 2,
+        zoomControl: true,
+        attributionControl: true,
+      });
+
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/">CARTO</a>',
+        subdomains: "abcd",
+        maxZoom: 19,
+      }).addTo(map);
+
+      mapRef.current = map;
+    });
+
+    return () => {
+      mapRef.current?.remove();
+      mapRef.current = null;
+    };
+  }, []);
+
+  // Update city markers when cities or selectedCity changes
+  useEffect(() => {
+    if (!mapRef.current) return;
+
+    import("leaflet").then((L) => {
+      const map = mapRef.current!;
+      const tripCityNames = new Set(trips.map((t) => t.city.toLowerCase()));
+
+      // Remove old markers
+      markersRef.current.forEach((m) => m.remove());
+      markersRef.current = [];
+
+      cities.forEach((city) => {
+        if (!city.lat || !city.lng) return;
+        const isSelected = selectedCity?.city === city.city;
+        const isTrip = tripCityNames.has(city.city.toLowerCase());
+        const radius = Math.max(14, Math.min(28, 10 + city.count * 1.5));
+
+        const marker = L.circleMarker([city.lat, city.lng], {
+          radius,
+          fillColor: isSelected ? "#818cf8" : "#4f46e5",
+          color: isSelected ? "#ffffff" : isTrip ? "#f59e0b" : "rgba(255,255,255,0.2)",
+          weight: isSelected ? 2 : 1.5,
+          fillOpacity: 0.9,
+        }).addTo(map);
+
+        // Label
+        const label = L.divIcon({
+          className: "",
+          html: `<div style="color:white;font-size:11px;font-weight:700;text-align:center;line-height:1;pointer-events:none">${city.count}</div>`,
+          iconSize: [radius * 2, radius * 2],
+          iconAnchor: [radius, radius],
+        });
+        L.marker([city.lat, city.lng], { icon: label, interactive: false }).addTo(map);
+
+        marker.on("click", () => onCityClick(city));
+        marker.bindTooltip(`<b>${city.city}</b><br>${city.count} connections`, {
+          className: "leaflet-tooltip-dark",
+          direction: "top",
+          offset: [0, -radius],
+        });
+
+        markersRef.current.push(marker);
+      });
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cities, selectedCity]);
+
+  // Trip-only markers
+  useEffect(() => {
+    if (!mapRef.current) return;
+
+    import("leaflet").then((L) => {
+      tripMarkersRef.current.forEach((m) => m.remove());
+      tripMarkersRef.current = [];
+
+      trips
+        .filter((t) => t.lat && t.lng && !cities.find((c) => c.city.toLowerCase() === t.city.toLowerCase()))
+        .forEach((trip) => {
+          const icon = L.divIcon({
+            className: "",
+            html: `<div style="width:28px;height:28px;background:#f59e0b;border-radius:50%;border:2px solid rgba(255,255,255,0.4);display:flex;align-items:center;justify-content:center">
+                     <svg width="13" height="13" viewBox="0 0 24 24" fill="white"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3" fill="none" stroke="white" stroke-width="2"/></svg>
+                   </div>`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14],
+          });
+          const m = L.marker([trip.lat!, trip.lng!], { icon })
+            .addTo(mapRef.current!)
+            .bindTooltip(`Trip: ${trip.city}`, { className: "leaflet-tooltip-dark", direction: "top" });
+          tripMarkersRef.current.push(m);
+        });
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trips, cities]);
 
   return (
     <>
-      <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
-      <Map
-        mapboxAccessToken={process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
-        initialViewState={{ longitude: 10, latitude: 25, zoom: 1.6 }}
-        style={{ width: "100%", height: "100%" }}
-        mapStyle="mapbox://styles/mapbox/dark-v11"
-      >
-        {/* Connection city markers */}
-        {cities.map((city) => {
-          if (!city.lat || !city.lng) return null;
-          const size = Math.max(28, Math.min(56, 22 + city.count * 2));
-          const isSelected = selectedCity?.city === city.city;
-          const isTrip = tripCityNames.has(city.city.toLowerCase());
-          return (
-            <Marker key={`city-${city.city}`} longitude={city.lng} latitude={city.lat} onClick={() => handleClick(city)}>
-              <div
-                className="rounded-full flex items-center justify-center text-white text-xs font-bold cursor-pointer shadow-lg transition-all hover:scale-110"
-                style={{
-                  width: size, height: size,
-                  backgroundColor: isSelected ? "#818cf8" : "#4f46e5",
-                  border: isSelected ? "2px solid white" : isTrip ? "2px solid #f59e0b" : "2px solid rgba(255,255,255,0.12)",
-                  boxShadow: isSelected ? "0 0 0 6px rgba(79,70,229,0.25)" : "0 2px 8px rgba(0,0,0,0.5)",
-                }}
-              >
-                {city.count}
-              </div>
-            </Marker>
-          );
-        })}
-
-        {/* Trip markers for cities with no connections yet */}
-        {trips
-          .filter((t) => t.lat && t.lng && !cities.find((c) => c.city.toLowerCase() === t.city.toLowerCase()))
-          .map((trip) => (
-            <Marker key={`trip-${trip.id}`} longitude={trip.lng!} latitude={trip.lat!}>
-              <div
-                className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg"
-                style={{ backgroundColor: "#f59e0b", border: "2px solid rgba(255,255,255,0.3)" }}
-                title={`Trip: ${trip.city}`}
-              >
-                <MapPin size={14} className="text-white" />
-              </div>
-            </Marker>
-          ))}
-
-        {/* Popup on selected city */}
-        {popupCity && popupCity.lat && popupCity.lng && (
-          <Popup
-            longitude={popupCity.lng} latitude={popupCity.lat}
-            onClose={() => setPopupCity(null)} closeButton={false} offset={20}
-            className="!bg-transparent !p-0 !shadow-none"
-          >
-            <div className="bg-gray-900 border border-gray-700 rounded-xl px-4 py-2 text-sm text-white shadow-2xl whitespace-nowrap">
-              <span className="font-medium">{popupCity.city}</span>
-              <span className="text-gray-400 ml-2">{popupCity.count} connections</span>
-            </div>
-          </Popup>
-        )}
-      </Map>
+      <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+      <style>{`
+        .leaflet-tooltip-dark {
+          background: #111827;
+          border: 1px solid #374151;
+          color: #f9fafb;
+          border-radius: 8px;
+          font-size: 12px;
+          padding: 6px 10px;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        .leaflet-tooltip-dark::before { border-top-color: #374151; }
+        .leaflet-container { background: #0f172a; }
+        .leaflet-control-attribution { background: rgba(17,24,39,0.8) !important; color: #6b7280 !important; }
+        .leaflet-control-attribution a { color: #6b7280 !important; }
+      `}</style>
+      <div ref={containerRef} className="w-full h-full" />
     </>
   );
 }
 
-// ─── SVG fallback map ─────────────────────────────────────────────────────────
+// ─── SVG fallback (no dependencies) ──────────────────────────────────────────
 
 function SvgMap({ cities, trips, selectedCity, onCityClick }: Props) {
   const tripCityNames = new Set(trips.map((t) => t.city.toLowerCase()));
 
   return (
     <div className="w-full h-full relative">
-      {/* Backdrop */}
       <svg viewBox="0 0 1000 500" className="absolute inset-0 w-full h-full opacity-[0.08]" preserveAspectRatio="xMidYMid slice">
         <rect width="1000" height="500" fill="#1e293b" />
         <path d="M60 160 Q80 130 120 140 Q160 150 180 180 Q200 210 190 240 Q180 270 150 275 Q120 280 100 260 Q70 240 60 210 Z" fill="#334155" />
@@ -116,8 +177,6 @@ function SvgMap({ cities, trips, selectedCity, onCityClick }: Props) {
         <path d="M720 130 Q760 115 810 120 Q855 128 870 155 Q882 180 870 210 Q858 238 830 248 Q800 255 768 245 Q736 232 722 205 Q705 175 720 130 Z" fill="#334155" />
         <path d="M750 280 Q790 265 830 278 Q870 295 880 330 Q888 365 862 388 Q835 410 800 405 Q763 398 748 370 Q730 338 750 280 Z" fill="#334155" />
       </svg>
-
-      {/* City pins */}
       {cities.map((city) => {
         if (!city.lat || !city.lng) return null;
         const { x, y } = toXY(city.lat, city.lng);
@@ -133,51 +192,35 @@ function SvgMap({ cities, trips, selectedCity, onCityClick }: Props) {
                 width: size, height: size,
                 backgroundColor: isSelected ? "#818cf8" : "#4f46e5",
                 border: isSelected ? "2px solid white" : isTrip ? "2px solid #f59e0b" : "2px solid rgba(255,255,255,0.12)",
-                boxShadow: isSelected ? "0 0 0 6px rgba(79,70,229,0.25)" : "0 2px 8px rgba(0,0,0,0.4)",
+                boxShadow: isSelected ? "0 0 0 6px rgba(79,70,229,0.25)" : undefined,
               }}>
               {city.count}
             </div>
-            <span className="absolute top-full left-1/2 -translate-x-1/2 mt-1 text-[10px] whitespace-nowrap px-1.5 py-0.5 rounded"
+            <span className="absolute top-full left-1/2 -translate-x-1/2 mt-1 text-[10px] whitespace-nowrap px-1 py-0.5 rounded"
               style={{ color: isSelected ? "white" : "#9ca3af", backgroundColor: isSelected ? "rgba(79,70,229,0.7)" : "transparent" }}>
               {city.city}
             </span>
           </button>
         );
       })}
-
-      {/* Trip pins for cities with no connections */}
-      {trips
-        .filter((t) => t.lat && t.lng && !cities.find((c) => c.city.toLowerCase() === t.city.toLowerCase()))
+      {trips.filter((t) => t.lat && t.lng && !cities.find((c) => c.city.toLowerCase() === t.city.toLowerCase()))
         .map((trip) => {
           const { x, y } = toXY(trip.lat!, trip.lng!);
           return (
-            <div key={trip.id} className="absolute -translate-x-1/2 -translate-y-1/2"
-              style={{ left: `${x}%`, top: `${y}%`, zIndex: 10 }}
-              title={`Trip: ${trip.city}`}>
-              <div className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg"
-                style={{ backgroundColor: "#f59e0b", border: "2px solid rgba(255,255,255,0.3)" }}>
+            <div key={trip.id} className="absolute -translate-x-1/2 -translate-y-1/2" style={{ left: `${x}%`, top: `${y}%`, zIndex: 10 }}>
+              <div className="w-8 h-8 rounded-full flex items-center justify-center shadow-lg" style={{ backgroundColor: "#f59e0b", border: "2px solid rgba(255,255,255,0.3)" }}>
                 <MapPin size={13} className="text-white" />
               </div>
               <span className="absolute top-full left-1/2 -translate-x-1/2 mt-1 text-[10px] text-amber-400 whitespace-nowrap">{trip.city}</span>
             </div>
           );
         })}
-
-      {/* Mapbox token prompt */}
-      <div className="absolute bottom-4 right-4 bg-gray-900/80 backdrop-blur border border-gray-700 rounded-xl px-4 py-3 text-xs text-gray-500 max-w-xs">
-        <span className="text-amber-400 font-medium">Add Mapbox token</span> in{" "}
-        <code className="text-gray-400">.env</code> for a real interactive map.{" "}
-        <a href="https://account.mapbox.com/access-tokens/" target="_blank" rel="noopener noreferrer"
-          className="text-indigo-400 hover:text-indigo-300">Get a free token →</a>
-      </div>
     </div>
   );
 }
 
-// ─── Auto-select Mapbox vs SVG ────────────────────────────────────────────────
+// ─── Entry: always use Leaflet now ───────────────────────────────────────────
 
 export default function WorldMap(props: Props) {
-  const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
-  if (token) return <MapboxMap {...props} />;
-  return <SvgMap {...props} />;
+  return <LeafletMap {...props} />;
 }
